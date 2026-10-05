@@ -1,0 +1,229 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Unique job ID (juga nama artifact)"
+        required: true
+        type: string
+      userId:
+        description: "User ID (opsional)"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "JSON string: { mode, url, buildType, tag, appName, iconUrl }"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse payload
+        id: payload
+        run: |
+          echo '${{ inputs.payload }}' > /tmp/payload.json
+          MODE=$(jq -r '.mode // "zip"' /tmp/payload.json)
+          URL=$(jq -r '.url // empty' /tmp/payload.json)
+          BUILD_TYPE=$(jq -r '.buildType // "release"' /tmp/payload.json)
+          APP_NAME=$(jq -r '.appName // "MyApp"' /tmp/payload.json)
+          ICON_URL=$(jq -r '.iconUrl // empty' /tmp/payload.json)
+          TAG=$(jq -r '.tag // empty' /tmp/payload.json)
+
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "icon_url=$ICON_URL" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "job_id=${{ inputs.jobId }}" >> $GITHUB_OUTPUT
+
+          echo "=== Payload ==="
+          cat /tmp/payload.json
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      # ─── MODE ZIP: download source project dari GitHub Release ───────────────
+      - name: Download & extract project ZIP
+        if: steps.payload.outputs.mode == 'zip'
+        run: |
+          set -e
+          URL="${{ steps.payload.outputs.url }}"
+          echo "Downloading project from: $URL"
+          mkdir -p /tmp/project
+          curl -L --fail --retry 3 -o /tmp/project.zip "$URL"
+          unzip -q /tmp/project.zip -d /tmp/extract
+
+          PROJECT_DIR=$(find /tmp/extract -name "pubspec.yaml" -type f | head -1 | xargs dirname)
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan di dalam ZIP!"
+            find /tmp/extract -maxdepth 3 -type f | head -50
+            exit 1
+          fi
+          echo "Project found at: $PROJECT_DIR"
+          cp -a "$PROJECT_DIR"/. /tmp/project/
+          echo "PROJECT_DIR=/tmp/project" >> $GITHUB_ENV
+
+      # ─── MODE URL (Web2APK): generate Flutter WebView project ───────────────
+      - name: Generate Web2APK Flutter project
+        if: steps.payload.outputs.mode == 'url'
+        run: |
+          set -e
+          APP_NAME="${{ steps.payload.outputs.app_name }}"
+          WEB_URL="${{ steps.payload.outputs.url }}"
+          ICON_URL="${{ steps.payload.outputs.icon_url }}"
+
+          PACKAGE_NAME=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g' | cut -c1-20)
+          if [ -z "$PACKAGE_NAME" ]; then PACKAGE_NAME="myapp"; fi
+          PACKAGE_ID="com.web2apk.${PACKAGE_NAME}"
+
+          echo "Creating Flutter project: $APP_NAME ($PACKAGE_ID)"
+          flutter create --org com.web2apk --project-name "$PACKAGE_NAME" --platforms android /tmp/project
+          cd /tmp/project
+
+          flutter pub add webview_flutter
+
+          cat > lib/main.dart << 'DART_EOF'
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+            runApp(const MyApp());
+          }
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'APP_TITLE_PLACEHOLDER',
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+                home: const WebViewPage(),
+              );
+            }
+          }
+
+          class WebViewPage extends StatefulWidget {
+            const WebViewPage({super.key});
+            @override
+            State<WebViewPage> createState() => _WebViewPageState();
+          }
+
+          class _WebViewPageState extends State<WebViewPage> {
+            late final WebViewController _controller;
+            bool _loading = true;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(NavigationDelegate(
+                  onPageFinished: (_) => setState(() => _loading = false),
+                ))
+                ..loadRequest(Uri.parse('WEB_URL_PLACEHOLDER'));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: Stack(
+                    children: [
+                      WebViewWidget(controller: _controller),
+                      if (_loading)
+                        const Center(child: CircularProgressIndicator()),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+          DART_EOF
+
+          sed -i "s|APP_TITLE_PLACEHOLDER|${APP_NAME}|g" lib/main.dart
+          sed -i "s|WEB_URL_PLACEHOLDER|${WEB_URL}|g" lib/main.dart
+          sed -i "s|android:label=\".*\"|android:label=\"${APP_NAME}\"|" android/app/src/main/AndroidManifest.xml
+
+          if [ -n "$ICON_URL" ] && [ "$ICON_URL" != "null" ]; then
+            echo "Downloading icon from $ICON_URL"
+            curl -L --fail --retry 2 -o /tmp/icon.png "$ICON_URL" || true
+            if [ -f /tmp/icon.png ]; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick
+              for density in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+                folder=$(echo $density | cut -d: -f1)
+                size=$(echo $density | cut -d: -f2)
+                convert /tmp/icon.png -resize \( {size}x \){size} \
+                  android/app/src/main/res/mipmap-${folder}/ic_launcher.png 2>/dev/null || true
+              done
+            fi
+          fi
+
+          echo "PROJECT_DIR=/tmp/project" >> $GITHUB_ENV
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          BUILD_TYPE="${{ steps.payload.outputs.build_type }}"
+          echo "Building APK (buildType=$BUILD_TYPE)..."
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug
+            APK_PATH="build/app/outputs/flutter-apk/app-debug.apk"
+          else
+            flutter build apk --release
+            APK_PATH="build/app/outputs/flutter-apk/app-release.apk"
+          fi
+
+          if [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: APK tidak ditemukan di $APK_PATH"
+            find build -name "*.apk" || true
+            exit 1
+          fi
+
+          JOB_ID="${{ steps.payload.outputs.job_id }}"
+          mkdir -p /tmp/artifact
+          cp "\( APK_PATH" "/tmp/artifact/apk- \){JOB_ID}.apk"
+          ls -lh /tmp/artifact/
+          echo "APK_PATH=/tmp/artifact/apk-${JOB_ID}.apk" >> $GITHUB_ENV
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: /tmp/artifact/apk-*.apk
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf /tmp/project /tmp/extract /tmp/project.zip /tmp/artifact || true
