@@ -1,0 +1,10 @@
+name = "flutter-build-worker"
+main = "worker.js"
+compatibility_date = "2026-10-05"
+workers_dev = true
+
+[vars]
+GITHUB_OWNER = "botspaceman85-bit"
+GITHUB_REPO = "flutter-build"
+GITHUB_WORKFLOW = "build-flutter.yml"
+GITHUB_REF = "main"
