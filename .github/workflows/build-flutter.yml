@@ -1,0 +1,180 @@
+name: Flutter Build Worker
+
+run-name: Flutter build ${{ inputs.jobId }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "Unique build/job ID"
+        required: true
+        type: string
+      userId:
+        description: "User ID from bot"
+        required: true
+        type: string
+      payload:
+        description: "JSON containing source URL and build type"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flutter-build-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Prepare directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/source"
+          mkdir -p "$RUNNER_TEMP/output"
+
+      - name: Validate inputs
+        shell: bash
+        env:
+          JOB_ID: ${{ inputs.jobId }}
+          USER_ID: ${{ inputs.userId }}
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          job_id = os.environ["JOB_ID"]
+          user_id = os.environ["USER_ID"]
+          payload = json.loads(os.environ["PAYLOAD"])
+          if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", job_id):
+              raise SystemExit("Invalid jobId")
+          if not user_id or len(user_id) > 120:
+              raise SystemExit("Invalid userId")
+          url = payload.get("url")
+          build_type = payload.get("buildType", "release")
+          if not isinstance(url, str) or not url.startswith("https://"):
+              raise SystemExit("payload.url must be HTTPS")
+          if build_type not in {"debug", "profile", "release"}:
+              raise SystemExit("buildType must be debug, profile, or release")
+          print(f"jobId={job_id}")
+          print(f"buildType={build_type}")
+          print(f"sourceHost={url.split('/')[2]}")
+          PY
+
+      - name: Download source ZIP
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.request
+          payload = json.loads(os.environ["PAYLOAD"])
+          url = payload["url"]
+          out = os.path.join(os.environ["RUNNER_TEMP"], "source.zip")
+          req = urllib.request.Request(url, headers={"User-Agent": "flutter-build-worker"})
+          with urllib.request.urlopen(req, timeout=120) as r, open(out, "wb") as f:
+              while True:
+                  chunk = r.read(1024 * 1024)
+                  if not chunk:
+                      break
+                  f.write(chunk)
+          print(f"Downloaded {out} ({os.path.getsize(out)} bytes)")
+          PY
+
+      - name: Extract source ZIP safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, zipfile
+          archive = os.path.join(os.environ["RUNNER_TEMP"], "source.zip")
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "source")
+          root = os.path.realpath(dest)
+          with zipfile.ZipFile(archive) as z:
+              for info in z.infolist():
+                  target = os.path.realpath(os.path.join(dest, info.filename))
+                  if target != root and not target.startswith(root + os.sep):
+                      raise SystemExit(f"Unsafe ZIP entry: {info.filename}")
+              z.extractall(dest)
+          print("Source extracted")
+          PY
+
+      - name: Locate Flutter project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUBSPEC=$(find "$RUNNER_TEMP/source" -maxdepth 6 -type f -name pubspec.yaml -print -quit)
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml not found in source ZIP"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Flutter project: $PROJECT_DIR"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        shell: bash
+        run: flutter doctor -v
+
+      - name: Flutter pub get
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+          BUILD_TYPE=$(python3 -c 'import json,os; print(json.loads(os.environ["PAYLOAD"]).get("buildType","release"))')
+          case "$BUILD_TYPE" in
+            debug) flutter build apk --debug ;;
+            profile) flutter build apk --profile ;;
+            release) flutter build apk --release ;;
+            *) echo "Invalid build type"; exit 1 ;;
+          esac
+
+      - name: Collect APK
+        shell: bash
+        env:
+          JOB_ID: ${{ inputs.jobId }}
+        run: |
+          set -euo pipefail
+          APK=$(find "${{ steps.project.outputs.project_dir }}/build/app/outputs/flutter-apk" -maxdepth 1 -type f -name "*.apk" -print -quit)
+          if [ -z "$APK" ]; then
+            echo "APK not found"
+            find "${{ steps.project.outputs.project_dir }}/build" -type f -name "*.apk" -print || true
+            exit 1
+          fi
+          cp "$APK" "$RUNNER_TEMP/output/app-${JOB_ID}.apk"
+          ls -lh "$RUNNER_TEMP/output/app-${JOB_ID}.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: ${{ runner.temp }}/output/app-${{ inputs.jobId }}.apk
+          if-no-files-found: error
+          retention-days: 1
