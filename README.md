@@ -1,136 +1,148 @@
-# GitHub Flutter Build Worker
+# Flutter Build Worker
 
-Worker ini dibuat agar cocok dengan `server.js` bot build yang melakukan:
+Sistem ini menjalankan build APK Flutter lewat GitHub Actions, lalu Cloudflare Worker menjadi API untuk bot.
 
-1. membuat GitHub Release sementara;
-2. upload ZIP source Flutter;
-3. `workflow_dispatch` ke `build-flutter.yml`;
-4. mengirim input `jobId`, `userId`, `payload`;
-5. menunggu artifact bernama `apk-${jobId}`;
-6. download artifact dari GitHub API.
+## Struktur
 
-## 1. Buat repository worker
+```text
+flutter-build/
+├── .github/
+│   └── workflows/
+│       └── build-flutter.yml
+├── .env.example
+├── .gitignore
+├── README.md
+├── package.json
+├── worker.js
+└── wrangler.toml
+```
 
-Contoh:
+## Alur
 
-    username/telegram-bot
+1. Bot mengirim `POST /build` ke Cloudflare Worker.
+2. Worker memanggil GitHub Actions `workflow_dispatch`.
+3. GitHub Actions mengunduh ZIP source Flutter.
+4. Actions menemukan `pubspec.yaml`, menjalankan `flutter pub get`, lalu `flutter build apk`.
+5. APK disimpan sebagai GitHub Actions artifact selama 1 hari.
+6. Bot mengecek `GET /status/:runId`.
+7. Jika selesai sukses, bot mengunduh `GET /artifact/:runId`. Hasilnya adalah ZIP artifact GitHub yang berisi APK.
 
-Upload folder `.github/workflows/build-flutter.yml` ke repository tersebut.
+Worker tidak menahan request `/build` sampai build selesai. Itu memang sengaja karena build dapat memakan waktu puluhan menit.
 
-Repository harus mengandung workflow ini pada branch default.
+## 1. GitHub token
 
-## 2. Aktifkan Actions
+Buat Fine-grained Personal Access Token yang hanya diberi akses ke repository `botspaceman85-bit/flutter-build`.
 
-GitHub:
-Settings -> Actions -> General
+Permission repository yang diperlukan:
 
-Pastikan Actions diizinkan berjalan.
+- Actions: Read and write
 
-## 3. Token GitHub
+Jangan kirim token ke chat dan jangan masukkan token ke `worker.js` atau commit Git.
 
-Bot membutuhkan token yang dapat:
+## 2. Deploy Cloudflare Worker
 
-- membaca repository;
-- membuat/menghapus Release sementara;
-- menjalankan workflow;
-- membaca artifact dan status workflow.
+Di folder project:
 
-Untuk fine-grained token, beri akses hanya ke repository worker dan berikan permission yang diperlukan untuk Contents dan Actions.
+```bash
+npm install
+npx wrangler login
+npx wrangler secret put GITHUB_TOKEN
+npx wrangler secret put WORKER_API_KEY
+npx wrangler deploy
+```
 
-JANGAN masukkan token ke file workflow.
+Saat `GITHUB_TOKEN` diminta, paste token GitHub.
+Saat `WORKER_API_KEY` diminta, masukkan password API panjang dan acak. Contoh membuatnya di Linux/Termux:
 
-## 4. Daftarkan worker di bot
+```bash
+openssl rand -hex 32
+```
 
-`githubworkers.json` di project bot harus berisi:
+Setelah deploy, Wrangler akan memberikan URL seperti:
 
-[
-  {
-    "id": "worker-1",
-    "label": "worker1",
-    "repo": "USERNAME/telegram-bot",
-    "token": "GITHUB_TOKEN_DI_SERVER_BOT",
-    "workflows": {
-      "flutter": "build-flutter.yml",
-      "android": "build-flutter.yml"
-    },
-    "enabled": true,
-    "addedBy": 123456789,
-    "addedAt": "2026-10-05T00:00:00.000Z"
-  }
-]
+```text
+https://flutter-build-worker.<subdomain>.workers.dev
+```
 
-Lebih aman menggunakan command `/addworkergithub` yang sudah tersedia di bot bila implementasinya sudah aktif, daripada menyimpan token manual di file.
+## 3. Cek worker
 
-## 5. Kontrak input
+```bash
+curl https://flutter-build-worker.<subdomain>.workers.dev/health
+```
 
-Workflow menerima:
+Hasil yang benar:
 
-jobId
-userId
-payload
-
-Contoh payload:
-
+```json
 {
-  "mode": "zip",
-  "url": "https://...",
-  "buildType": "release",
-  "tag": "..."
+  "ok": true,
+  "service": "flutter-build-worker"
 }
+```
 
-`payload.url` adalah URL ZIP source yang dibuat oleh `server.js`.
+## 4. Memulai build
 
-## 6. Kontrak output
+Request:
 
-Artifact HARUS:
+```bash
+curl -X POST "https://flutter-build-worker.<subdomain>.workers.dev/build" \
+  -H "Authorization: Bearer YOUR_WORKER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jobId": "test-001",
+    "userId": "123",
+    "url": "https://github.com/OWNER/REPO/releases/download/VERSION/source.zip",
+    "buildType": "release"
+  }'
+```
 
-    apk-${jobId}
+`url` harus URL HTTPS dari host GitHub yang diizinkan oleh `worker.js`.
 
-Di dalam artifact terdapat file:
+Response normal:
 
-    app-${jobId}.apk
+```json
+{
+  "ok": true,
+  "jobId": "test-001",
+  "runId": 1234567890,
+  "runUrl": "https://github.com/botspaceman85-bit/flutter-build/actions/runs/1234567890",
+  "artifactName": "apk-test-001",
+  "message": "Build queued"
+}
+```
 
-`server.js` mencari artifact berdasarkan nama `apk-${jobId}`, jadi jangan ubah nama tersebut tanpa mengubah `server.js`.
+## 5. Cek status
 
-## 7. Format ZIP Flutter
+```bash
+curl "https://flutter-build-worker.<subdomain>.workers.dev/status/1234567890" \
+  -H "Authorization: Bearer YOUR_WORKER_API_KEY"
+```
 
-ZIP paling aman jika langsung berisi:
+Saat masih jalan, `status` biasanya `queued` atau `in_progress`.
+Saat selesai sukses:
 
-pubspec.yaml
-lib/
-android/
-ios/
-...
+```json
+{
+  "ok": true,
+  "runId": 1234567890,
+  "status": "completed",
+  "conclusion": "success"
+}
+```
 
-Kalau ZIP mempunyai satu folder pembungkus, workflow juga mencoba mencari `pubspec.yaml` sampai kedalaman 4 folder.
+## 6. Download artifact
 
-## 8. Build mode
+```bash
+curl -L "https://flutter-build-worker.<subdomain>.workers.dev/artifact/1234567890" \
+  -H "Authorization: Bearer YOUR_WORKER_API_KEY" \
+  -o apk-1234567890.zip
+```
 
-`buildType`:
+ZIP tersebut berisi APK.
 
-- `release` -> `flutter build apk --release`
-- `debug` -> `flutter build apk --debug`
-- `profile` -> `flutter build apk --profile`
+## Catatan penting
 
-## 9. Catatan penting
-
-Workflow ini hanya membangun project Flutter yang sudah valid.
-
-Jika project membutuhkan:
-
-- private package;
-- keystore signing;
-- Firebase secret;
-- `google-services.json`;
-- environment variables;
-- private Git repository;
-
-maka secret/credential tersebut harus disediakan sebagai GitHub Actions Secrets/Variables dan workflow perlu disesuaikan.
-
-Jangan upload credential ke ZIP source.
-
-## 10. Keamanan
-
-Token GitHub yang pernah dimasukkan ke `githubworkers.json` atau chat/log harus dianggap bocor.
-
-Jika token pernah terekspos, revoke token tersebut dan buat token baru sebelum production.
+- File workflow harus tepat berada di `.github/workflows/build-flutter.yml`.
+- Repository dan branch default pada konfigurasi ini adalah `botspaceman85-bit/flutter-build` dan `main`.
+- Jangan commit `GITHUB_TOKEN` atau `WORKER_API_KEY`.
+- APK artifact otomatis kedaluwarsa setelah 1 hari.
+- Source ZIP harus berisi project Flutter dengan `pubspec.yaml`.
